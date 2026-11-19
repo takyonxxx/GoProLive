@@ -32,13 +32,21 @@ final class StreamCounters: @unchecked Sendable {
     }
 }
 
+/// Kameranın konuştuğu Wi-Fi API'si; bağlanırken otomatik algılanır.
+enum CameraAPI {
+    /// gpControl, port 80: HERO5 - HERO8
+    case legacy
+    /// Open GoPro, port 8080: HERO9 ve sonrası
+    case openGoPro
+}
+
 @MainActor
 final class GoProClient: ObservableObject {
     enum State: Equatable {
         case disconnected, connecting, connected, starting, streaming
     }
 
-    // HERO7 Wi-Fi erişim noktası sabitleri
+    // GoPro Wi-Fi erişim noktası sabitleri (tüm modellerde aynı)
     private let host = "10.5.5.9"
     private let streamPort: UInt16 = 8554
     /// Yeniden yayın için RTSP (TCP) portu; kameradan alım UDP olduğu için aynı numara çakışmaz.
@@ -47,6 +55,7 @@ final class GoProClient: ObservableObject {
 
     @Published private(set) var state: State = .disconnected
     @Published private(set) var cameraName = ""
+    @Published private(set) var api: CameraAPI = .legacy
     @Published private(set) var message = L("GoPro Wi-Fi ağına bağlanın, sonra Bağlan'a dokunun.", "Join the GoPro Wi-Fi network, then tap Connect.")
     @Published private(set) var bitrateKbps = 0
     @Published private(set) var fps = 0
@@ -57,7 +66,7 @@ final class GoProClient: ObservableObject {
     /// Kameranın bildirdiği ayarlar (ayar no -> değer); kontrol sayfası seçili olanı buradan gösterir.
     @Published private(set) var cameraSettings = [Int: Int]()
     @Published private(set) var isRecording = false
-    /// 0 = video, 1 = fotoğraf, 2 = çoklu çekim
+    /// 0 = video, 1 = fotoğraf, 2 = çoklu çekim (yeni modellerde timelapse)
     @Published private(set) var cameraMode: Int?
     @Published private(set) var remainingVideoSeconds: Int?
     /// Son gönderilen komutun sonucu.
@@ -121,15 +130,7 @@ final class GoProClient: ObservableObject {
         state = .connecting
         message = L("Kamera aranıyor…", "Searching for camera…")
         do {
-            let data = try await get("/gp/gpControl/info")
-            var name = "GoPro"
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let info = json["info"] as? [String: Any] {
-                let model = info["model_name"] as? String ?? "GoPro"
-                let firmware = info["firmware_version"] as? String ?? ""
-                name = firmware.isEmpty ? model : "\(model) (\(firmware))"
-            }
-            cameraName = name
+            cameraName = try await detectCamera()
             state = .connected
             message = L("Bağlandı.", "Connected.")
             await refreshBattery()
@@ -154,7 +155,7 @@ final class GoProClient: ObservableObject {
             await ensureWidescreen()
 
             // Önizleme için 720p iste; HERO7 bunu yok sayıp 848×480 veriyor, zararı yok.
-            _ = try? await get("/gp/gpControl/setting/64/7")
+            if api == .legacy { _ = try? await get("/gp/gpControl/setting/64/7") }
             try await sendRestart()
 
             counters.touch()
@@ -185,7 +186,9 @@ final class GoProClient: ObservableObject {
         state = .connected
         message = L("Yayın durduruldu.", "Stream stopped.")
         if notifyCamera {
-            _ = try? await get("/gp/gpControl/execute?p1=gpStream&a1=proto_v2&c1=stop")
+            _ = try? await get(api == .openGoPro
+                ? "/gopro/camera/stream/stop"
+                : "/gp/gpControl/execute?p1=gpStream&a1=proto_v2&c1=stop")
         }
     }
 
@@ -230,15 +233,18 @@ final class GoProClient: ObservableObject {
 
     var isCameraReachable: Bool { state == .connected || state == .streaming }
 
-    /// `/gp/gpControl/` altındaki bir komutu yollar, sonucu `commandMessage`'a yazar ve durumu tazeler.
+    /// Bip ile bulma ve uzaktan kapatma yalnızca eski API'de (HERO5 - HERO8) var.
+    var supportsLocateAndPowerOff: Bool { api == .legacy }
+
+    /// Bir komut yolunu kameraya yollar, sonucu `commandMessage`'a yazar ve durumu tazeler.
     @discardableResult
-    func sendCommand(_ path: String, label: String) async -> Bool {
+    private func sendCommand(_ path: String, label: String) async -> Bool {
         guard isCameraReachable else {
             commandMessage = L("Kamera bağlı değil.", "Camera not connected.")
             return false
         }
         do {
-            _ = try await get("/gp/gpControl/" + path)
+            _ = try await get(path)
             commandMessage = "\(label): " + L("gönderildi", "sent")
             try? await Task.sleep(nanoseconds: 400_000_000)
             await refreshBattery()
@@ -250,26 +256,67 @@ final class GoProClient: ObservableObject {
     }
 
     func setSetting(_ id: Int, _ value: Int, label: String) async {
-        await sendCommand("setting/\(id)/\(value)", label: label)
+        let path = api == .openGoPro
+            ? "/gopro/camera/setting?setting=\(id)&option=\(value)"
+            : "/gp/gpControl/setting/\(id)/\(value)"
+        await sendCommand(path, label: label)
+    }
+
+    /// Kaydı başlatır/durdurur (fotoğraf modunda fotoğraf çeker).
+    func setShutter(_ on: Bool) async {
+        let path = api == .openGoPro
+            ? "/gopro/camera/shutter/\(on ? "start" : "stop")"
+            : "/gp/gpControl/command/shutter?p=\(on ? 1 : 0)"
+        await sendCommand(path, label: on ? L("Deklanşör", "Shutter") : L("Kaydı durdur", "Stop recording"))
+    }
+
+    /// 0 = video, 1 = fotoğraf, 2 = çoklu çekim / timelapse
+    func setMode(_ mode: Int, label: String) async {
+        let path = api == .openGoPro
+            ? "/gopro/camera/presets/set_group?id=\(1000 + mode)"
+            : "/gp/gpControl/command/mode?p=\(mode)"
+        await sendCommand(path, label: label)
+    }
+
+    func addHilight() async {
+        let path = api == .openGoPro
+            ? "/gopro/media/hilight/moment"
+            : "/gp/gpControl/command/storage/tag_moment"
+        await sendCommand(path, label: L("HiLight etiketi", "HiLight tag"))
+    }
+
+    /// Kamerayı bip sesiyle buldurur (yalnızca eski API).
+    func locate(_ on: Bool) async {
+        guard supportsLocateAndPowerOff else { return }
+        await sendCommand("/gp/gpControl/command/system/locate?p=\(on ? 1 : 0)",
+                          label: on ? L("Kamerayı bul", "Locate camera") : L("Bip'i durdur", "Stop beep"))
     }
 
     func refreshStatus() async {
         await refreshBattery()
     }
 
-    /// Kameranın saatini bu cihazın saatine eşitler (p = %YY%AA%GG%SS%DD%ss, onaltılık).
+    /// Kameranın saatini bu cihazın saatine eşitler.
     func syncClock() async {
         let c = Calendar(identifier: .gregorian)
             .dateComponents([.year, .month, .day, .hour, .minute, .second], from: Date())
-        let values = [(c.year ?? 2000) % 100, c.month ?? 1, c.day ?? 1,
-                      c.hour ?? 0, c.minute ?? 0, c.second ?? 0]
-        let p = values.map { String(format: "%%%02x", $0) }.joined()
-        await sendCommand("command/setup/date_time?p=\(p)", label: L("Saat eşitleme", "Clock sync"))
+        let label = L("Saat eşitleme", "Clock sync")
+        if api == .openGoPro {
+            let date = "\(c.year ?? 2000)_\(c.month ?? 1)_\(c.day ?? 1)"
+            let time = "\(c.hour ?? 0)_\(c.minute ?? 0)_\(c.second ?? 0)"
+            await sendCommand("/gopro/camera/set_date_time?date=\(date)&time=\(time)", label: label)
+        } else {
+            // p = %YY%AA%GG%SS%DD%ss (onaltılık)
+            let values = [(c.year ?? 2000) % 100, c.month ?? 1, c.day ?? 1,
+                          c.hour ?? 0, c.minute ?? 0, c.second ?? 0]
+            let p = values.map { String(format: "%%%02x", $0) }.joined()
+            await sendCommand("/gp/gpControl/command/setup/date_time?p=\(p)", label: label)
+        }
     }
 
-    /// Kamerayı kapatır; Wi-Fi de kapanacağı için bağlantıyı keser.
+    /// Kamerayı kapatır; Wi-Fi de kapanacağı için bağlantıyı keser (yalnızca eski API).
     func powerOff() async {
-        guard isCameraReachable else { return }
+        guard isCameraReachable, supportsLocateAndPowerOff else { return }
         await stopStream()
         _ = try? await get("/gp/gpControl/command/system/sleep")
         await disconnect()
@@ -280,7 +327,14 @@ final class GoProClient: ObservableObject {
 
     private func sendRestart() async throws {
         lastRestart = Date()
-        _ = try await get("/gp/gpControl/execute?p1=gpStream&a1=proto_v2&c1=restart")
+        switch api {
+        case .legacy:
+            _ = try await get("/gp/gpControl/execute?p1=gpStream&a1=proto_v2&c1=restart")
+        case .openGoPro:
+            // Önizleme zaten açıksa "start" hata döndürebilir; önce durdur.
+            _ = try? await get("/gopro/camera/stream/stop")
+            _ = try await get("/gopro/camera/stream/start")
+        }
     }
 
     /// Saniyede bir: istatistik + keep-alive (2 sn'de bir) + veri kesilirse yeniden başlatma.
@@ -302,6 +356,10 @@ final class GoProClient: ObservableObject {
 
         if tick % 2 == 0 {
             udp.send(keepAlive, host: host, port: streamPort)
+            if api == .openGoPro {
+                // Open GoPro: HTTP keep-alive (döngüyü bekletmeden)
+                Task { [weak self] in _ = try? await self?.get("/gopro/camera/keep_alive") }
+            }
         }
 
         // Pil: 10 sn'de bir, keep-alive döngüsünü bekletmeden.
@@ -333,11 +391,17 @@ final class GoProClient: ObservableObject {
     /// Önizleme, çekim modunun en-boy oranını izler; 16:9 gelmesi için kamerayı video moduna alır
     /// ve video çözünürlüğü 4:3 ise 1080p'ye çevirir. Hatalar yok sayılır (yayın yine başlar).
     private func ensureWidescreen() async {
+        if api == .openGoPro {
+            // Video ön ayar grubu; yeni modellerde kayıt çözünürlüğüne dokunulmaz.
+            _ = try? await get("/gopro/camera/presets/set_group?id=1000")
+            return
+        }
+
         // Video modu (fotoğraf/çoklu çekim modlarında önizleme 4:3 gelir)
         _ = try? await get("/gp/gpControl/command/mode?p=0")
 
         // Ayar 2 = video çözünürlüğü. 4:3 olanlar: 6 (2.7K 4:3), 7 (1440p), 10 (960p), 18 (4K 4:3)
-        guard let data = try? await get("/gp/gpControl/status"),
+        guard let data = try? await get(statusPath),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let settings = json["settings"] as? [String: Any],
               let resolution = (settings["2"] as? NSNumber)?.intValue,
@@ -346,15 +410,21 @@ final class GoProClient: ObservableObject {
         try? await Task.sleep(nanoseconds: 500_000_000)   // kameranın moda geçmesini bekle
     }
 
-    /// `/gp/gpControl/status`: "70" = pil yüzdesi, "2" = pil çubukları (0-3, 4 = şarj oluyor).
+    /// Durum uç noktası (iki API'de de aynı numaralar): "70" = pil yüzdesi, "2" = pil çubukları (0-3, 4 = şarj oluyor).
     private func refreshBattery() async {
         guard state != .disconnected, state != .connecting,
-              let data = try? await get("/gp/gpControl/status"),
+              let data = try? await get(statusPath),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let status = json["status"] as? [String: Any] else { return }
         let bars = (status["2"] as? NSNumber)?.intValue
         isRecording = (status["10"] as? NSNumber)?.intValue == 1        // 10 = kayıt sürüyor
-        cameraMode = (status["43"] as? NSNumber)?.intValue              // 43 = geçerli mod
+        if api == .openGoPro {
+            // 96 = ön ayar grubu: 1000 video, 1001 fotoğraf, 1002 timelapse
+            let group = (status["96"] as? NSNumber)?.intValue
+            cameraMode = group.flatMap { (1000...1002).contains($0) ? $0 - 1000 : nil }
+        } else {
+            cameraMode = (status["43"] as? NSNumber)?.intValue          // 43 = geçerli mod
+        }
         remainingVideoSeconds = (status["35"] as? NSNumber)?.intValue   // 35 = kalan video süresi
         if let raw = json["settings"] as? [String: Any] {
             var parsed = [Int: Int]()
@@ -390,9 +460,49 @@ final class GoProClient: ObservableObject {
         #endif
     }
 
+    /// Önce eski API'yi (port 80), olmazsa Open GoPro'yu (port 8080) dener; kamera adını döndürür.
+    private func detectCamera() async throws -> String {
+        do {
+            let data = try await fetch("http://\(host)/gp/gpControl/info", timeout: 3)
+            api = .legacy
+            return GoProClient.cameraName(from: data)
+        } catch {
+            // Port 80 yanıt vermedi: HERO9+ olabilir.
+        }
+
+        _ = try await fetch("http://\(host):8080/gopro/version", timeout: 3)
+        api = .openGoPro
+        // Model adı: yeni uç nokta, yoksa 8080'deki eski bilgi uç noktası.
+        for path in ["/gopro/camera/info", "/gp/gpControl/info"] {
+            if let data = try? await fetch("http://\(host):8080\(path)", timeout: 3) {
+                let name = GoProClient.cameraName(from: data)
+                if name != "GoPro" { return name }
+            }
+        }
+        return "GoPro"
+    }
+
+    private static func cameraName(from data: Data) -> String {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return "GoPro" }
+        let info = json["info"] as? [String: Any] ?? json
+        guard let model = info["model_name"] as? String, !model.isEmpty else { return "GoPro" }
+        let firmware = info["firmware_version"] as? String ?? ""
+        return firmware.isEmpty ? model : "\(model) (\(firmware))"
+    }
+
+    private var statusPath: String {
+        api == .openGoPro ? "/gopro/camera/state" : "/gp/gpControl/status"
+    }
+
     private func get(_ path: String) async throws -> Data {
-        guard let url = URL(string: "http://\(host)\(path)") else { throw URLError(.badURL) }
-        let (data, response) = try await session.data(from: url)
+        try await fetch((api == .openGoPro ? "http://\(host):8080" : "http://\(host)") + path)
+    }
+
+    private func fetch(_ urlString: String, timeout: TimeInterval = 5) async throws -> Data {
+        guard let url = URL(string: urlString) else { throw URLError(.badURL) }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw URLError(.badServerResponse)
         }

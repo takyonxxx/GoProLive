@@ -1,12 +1,15 @@
 import SwiftUI
 
 /// Kameraya komut ve ayar gönderen düğmelerin bulunduğu sayfa.
-/// Değerler GoPro Wi-Fi API'sinin (gpControl, HERO5-7) ayar numaralarıdır.
+/// Ayar numaraları kameranın API'sine göre seçilir: gpControl (HERO5-8) ya da Open GoPro (HERO9+).
 struct CameraControlView: View {
     @ObservedObject var gopro: GoProClient
     @Environment(\.dismiss) private var dismiss
     @State private var confirmPowerOff = false
     @AppStorage(AppLanguage.storageKey) private var language = AppLanguage.turkish
+
+    /// HERO9 ve sonrası (Open GoPro)
+    private var isModern: Bool { gopro.api == .openGoPro }
 
     private struct Option: Identifiable {
         let label: String
@@ -24,12 +27,7 @@ struct CameraControlView: View {
                         recordingSection
                         modeSection
 
-                        settingSection(L("Çözünürlük", "Resolution"), id: 2, options: [
-                            Option(label: "4K", value: 1),
-                            Option(label: "2.7K", value: 4),
-                            Option(label: "1080p", value: 9),
-                            Option(label: "720p", value: 12),
-                        ])
+                        settingSection(L("Çözünürlük", "Resolution"), id: 2, options: resolutionOptions)
                         settingSection(L("Kare hızı", "Frame rate"), id: 3, options: [
                             Option(label: "24", value: 10),
                             Option(label: "30", value: 8),
@@ -37,27 +35,23 @@ struct CameraControlView: View {
                             Option(label: "120", value: 1),
                             Option(label: "240", value: 0),
                         ])
-                        settingSection(L("Görüş açısı", "Field of view"), id: 4, options: [
-                            Option(label: L("Geniş", "Wide"), value: 0),
-                            Option(label: "SuperView", value: 3),
-                            Option(label: L("Doğrusal", "Linear"), value: 4),
-                        ])
-                        settingSection(L("Sabitleme", "Stabilization"), id: 78, options: [
-                            Option(label: L("Kapalı", "Off"), value: 0),
-                            Option(label: L("Açık", "On"), value: 1),
-                        ])
+                        // Yeni modellerde: 121 = dijital lens, 135 = HyperSmooth
+                        settingSection(L("Görüş açısı", "Field of view"), id: isModern ? 121 : 4, options: fieldOfViewOptions)
+                        settingSection(L("Sabitleme", "Stabilization"), id: isModern ? 135 : 78, options: stabilizationOptions)
                         settingSection(L("Oto kapanma", "Auto off"), id: 59, options: [
                             Option(label: L("Asla", "Never"), value: 0),
                             Option(label: L("5 dk", "5 min"), value: 4),
                             Option(label: L("15 dk", "15 min"), value: 6),
                             Option(label: L("30 dk", "30 min"), value: 7),
                         ])
-                        settingSection(L("Bip sesi", "Beep volume"), id: 87, options: [
-                            Option(label: L("Kapalı", "Off"), value: 0),
-                            Option(label: L("Düşük", "Low"), value: 40),
-                            Option(label: L("Orta", "Medium"), value: 70),
-                            Option(label: L("Yüksek", "High"), value: 100),
-                        ])
+                        if !isModern {
+                            settingSection(L("Bip sesi", "Beep volume"), id: 87, options: [
+                                Option(label: L("Kapalı", "Off"), value: 0),
+                                Option(label: L("Düşük", "Low"), value: 40),
+                                Option(label: L("Orta", "Medium"), value: 70),
+                                Option(label: L("Yüksek", "High"), value: 100),
+                            ])
+                        }
 
                         cameraSection
                     }
@@ -92,6 +86,56 @@ struct CameraControlView: View {
         } message: {
             Text(L("Kamera kapanınca Wi-Fi bağlantısı da kesilir; yeniden açmak için kameradaki düğmeye basmanız gerekir.", "Powering off also drops the Wi-Fi connection; you'll need to press the button on the camera to turn it back on."))
         }
+    }
+
+    // MARK: - Modele göre seçenekler
+
+    private var resolutionOptions: [Option] {
+        if isModern {
+            return [
+            Option(label: "5.3K", value: 100),
+            Option(label: "4K", value: 1),
+            Option(label: "2.7K", value: 4),
+            Option(label: "1080p", value: 9),
+            ]
+        }
+        return [
+            Option(label: "4K", value: 1),
+            Option(label: "2.7K", value: 4),
+            Option(label: "1080p", value: 9),
+            Option(label: "720p", value: 12),
+        ]
+    }
+
+    private var fieldOfViewOptions: [Option] {
+        if isModern {
+            return [
+            Option(label: L("Geniş", "Wide"), value: 0),
+            Option(label: "SuperView", value: 3),
+            Option(label: L("Doğrusal", "Linear"), value: 4),
+            Option(label: L("Dar", "Narrow"), value: 2),
+            ]
+        }
+        return [
+            Option(label: L("Geniş", "Wide"), value: 0),
+            Option(label: "SuperView", value: 3),
+            Option(label: L("Doğrusal", "Linear"), value: 4),
+        ]
+    }
+
+    private var stabilizationOptions: [Option] {
+        if isModern {
+            return [
+            Option(label: L("Kapalı", "Off"), value: 0),
+            Option(label: L("Açık", "On"), value: 1),
+            Option(label: "Boost", value: 3),
+            Option(label: L("Oto", "Auto"), value: 4),
+            ]
+        }
+        return [
+            Option(label: L("Kapalı", "Off"), value: 0),
+            Option(label: L("Açık", "On"), value: 1),
+        ]
     }
 
     // MARK: - Bölümler
@@ -135,16 +179,16 @@ struct CameraControlView: View {
             HStack(spacing: 8) {
                 if gopro.isRecording {
                     actionButton(L("Kaydı Durdur", "Stop Recording"), systemImage: "stop.fill", tint: .red) {
-                        await gopro.sendCommand("command/shutter?p=0", label: L("Kaydı durdur", "Stop recording"))
+                        await gopro.setShutter(false)
                     }
                 } else {
                     actionButton(gopro.cameraMode == 0 || gopro.cameraMode == nil ? L("Kaydı Başlat", "Start Recording") : L("Deklanşör", "Shutter"),
                                  systemImage: "record.circle", tint: .red) {
-                        await gopro.sendCommand("command/shutter?p=1", label: L("Deklanşör", "Shutter"))
+                        await gopro.setShutter(true)
                     }
                 }
                 actionButton("HiLight", systemImage: "tag.fill") {
-                    await gopro.sendCommand("command/storage/tag_moment", label: L("HiLight etiketi", "HiLight tag"))
+                    await gopro.addHilight()
                 }
             }
         }
@@ -155,21 +199,23 @@ struct CameraControlView: View {
             optionGrid([
                 Option(label: "Video", value: 0),
                 Option(label: L("Fotoğraf", "Photo"), value: 1),
-                Option(label: L("Çoklu", "Multi"), value: 2),
+                Option(label: isModern ? "Timelapse" : L("Çoklu", "Multi"), value: 2),
             ], selected: gopro.cameraMode) { option in
-                await gopro.sendCommand("command/mode?p=\(option.value)", label: L("Mod", "Mode") + " \(option.label)")
+                await gopro.setMode(option.value, label: L("Mod", "Mode") + " \(option.label)")
             }
         }
     }
 
     private var cameraSection: some View {
         VStack(spacing: 10) {
-            HStack(spacing: 8) {
-                actionButton(L("Bul (bip)", "Locate (beep)"), systemImage: "speaker.wave.2.fill") {
-                    await gopro.sendCommand("command/system/locate?p=1", label: L("Kamerayı bul", "Locate camera"))
-                }
-                actionButton(L("Bip'i Durdur", "Stop Beep"), systemImage: "speaker.slash.fill") {
-                    await gopro.sendCommand("command/system/locate?p=0", label: L("Bip'i durdur", "Stop beep"))
+            if gopro.supportsLocateAndPowerOff {
+                HStack(spacing: 8) {
+                    actionButton(L("Bul (bip)", "Locate (beep)"), systemImage: "speaker.wave.2.fill") {
+                        await gopro.locate(true)
+                    }
+                    actionButton(L("Bip'i Durdur", "Stop Beep"), systemImage: "speaker.slash.fill") {
+                        await gopro.locate(false)
+                    }
                 }
             }
             HStack(spacing: 8) {
@@ -179,6 +225,7 @@ struct CameraControlView: View {
                 actionButton(L("Yenile", "Refresh"), systemImage: "arrow.clockwise") {
                     await gopro.refreshStatus()
                 }
+                if gopro.supportsLocateAndPowerOff {
                 Button(role: .destructive) {
                     confirmPowerOff = true
                 } label: {
@@ -190,6 +237,7 @@ struct CameraControlView: View {
                 }
                 .buttonStyle(.bordered)
                 .buttonBorderShape(.roundedRectangle(radius: 8))
+                }
             }
         }
         .padding(.top, 8)
@@ -261,7 +309,7 @@ struct CameraControlView: View {
         switch gopro.cameraMode {
         case 0: return "Video"
         case 1: return L("Fotoğraf", "Photo")
-        case 2: return L("Çoklu çekim", "Multi-shot")
+        case 2: return isModern ? "Timelapse" : L("Çoklu çekim", "Multi-shot")
         default: return L("Mod bilinmiyor", "Mode unknown")
         }
     }
